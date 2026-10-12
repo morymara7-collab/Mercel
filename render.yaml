@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: mercel-atelier-caisse
+    runtime: docker
+    plan: free
+    region: frankfurt
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: DATA_DIR
+        value: /data
+      - key: ADMIN_CODE_DEFAULT
+        sync: false
+      - key: CAISSE_CODE_DEFAULT
+        sync: false
+    # Plan gratuit : pas de disque persistant possible (Render ne le propose
+    # que sur les plans payants). Les ventes/le stock peuvent être effacés si
+    # le service redémarre — utilise le bouton "Exporter les données" dans
+    # l'onglet Administration pour sauvegarder régulièrement en attendant de
+    # passer sur un plan payant (voir render.paid.yaml, qui ajoute un disque
+    # persistant de 1 Go — il suffit de renommer ce fichier pour l'activer).

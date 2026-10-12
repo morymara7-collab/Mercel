@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: mercel-atelier-caisse
+    runtime: docker
+    plan: starter
+    region: frankfurt
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: DATA_DIR
+        value: /data
+      - key: ADMIN_CODE_DEFAULT
+        sync: false
+      - key: CAISSE_CODE_DEFAULT
+        sync: false
+    disk:
+      name: atelier-data
+      mountPath: /data
+      sizeGB: 1
