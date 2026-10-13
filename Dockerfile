@@ -1,7 +1,7 @@
 FROM python:3.12-slim
 WORKDIR /app
 COPY server.py ./
-COPY static ./static
+COPY app.js index.html logo.jpg style.css ./static/
 ENV DATA_DIR=/data
 ENV PORT=8000
 EXPOSE 8000
