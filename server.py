@@ -432,6 +432,9 @@ class Handler(BaseHTTPRequestHandler):
             if method == "POST" and path == "/api/admin/code":
                 self._api_change_code(conn)
                 return
+            if method == "POST" and path == "/api/import":
+                self._api_import(conn)
+                return
             self._send_json(404, {"error": "Route inconnue."})
         finally:
             conn.close()
@@ -655,6 +658,76 @@ class Handler(BaseHTTPRequestHandler):
             )
             conn.commit()
         self._send_json(200, {"ok": True})
+
+    def _api_import(self, conn):
+        """Restaure stock/ventes/articles/journal à partir d'un fichier exporté par
+        /api/export. Remplace entièrement les données actuelles (hors codes d'accès)."""
+        s = self._require_admin()
+        data = self._read_json()
+        required = ("stock_items", "ventes", "vente_articles", "audit_log")
+        for key in required:
+            if key not in data or not isinstance(data[key], list):
+                raise ApiError(400, f"Fichier de sauvegarde invalide : « {key} » manquant ou incorrect.")
+
+        with _db_lock:
+            conn.execute("DELETE FROM vente_articles")
+            conn.execute("DELETE FROM ventes")
+            conn.execute("DELETE FROM stock_items")
+            conn.execute("DELETE FROM audit_log")
+
+            for it in data["stock_items"]:
+                conn.execute(
+                    "INSERT INTO stock_items (id, nom, categorie, unite, quantite, seuil_alerte, "
+                    "prix_achat, prix_vente) VALUES (?,?,?,?,?,?,?,?)",
+                    (it["id"], it["nom"], it.get("categorie") or "Autre", it.get("unite") or "pièce",
+                     it.get("quantite") or 0, it.get("seuil_alerte") or 2, it.get("prix_achat") or 0,
+                     it.get("prix_vente") or 0),
+                )
+            for v in data["ventes"]:
+                conn.execute(
+                    "INSERT INTO ventes (id, numero, date_iso, caissiere_nom, technicien, client_nom, "
+                    "client_tel, type_vehicule, marque, immatriculation, km_actuel, km_prochain, "
+                    "type_travail, montant, montant_pieces, montant_main_oeuvre, visite_numero, "
+                    "annulee, motif_annulation) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (v["id"], v["numero"], v["date_iso"], v["caissiere_nom"], v.get("technicien"),
+                     v["client_nom"], v.get("client_tel"), v.get("type_vehicule"), v.get("marque"),
+                     v.get("immatriculation"), v.get("km_actuel"), v.get("km_prochain"),
+                     v.get("type_travail"), v.get("montant") or 0, v.get("montant_pieces") or 0,
+                     v.get("montant_main_oeuvre") or 0, v.get("visite_numero") or 1,
+                     v.get("annulee") or 0, v.get("motif_annulation") or ""),
+                )
+            for a in data["vente_articles"]:
+                conn.execute(
+                    "INSERT INTO vente_articles (id, vente_id, item_id, nom, quantite) VALUES (?,?,?,?,?)",
+                    (a["id"], a["vente_id"], a.get("item_id"), a["nom"], a["quantite"]),
+                )
+            for log in data["audit_log"]:
+                conn.execute(
+                    "INSERT INTO audit_log (id, date_iso, acteur, action, cible, motif) "
+                    "VALUES (?,?,?,?,?,?)",
+                    (log["id"], log["date_iso"], log["acteur"], log["action"], log["cible"],
+                     log["motif"]),
+                )
+
+            # Resynchronise les compteurs auto-incrément pour éviter des collisions d'ID
+            # sur les prochains enregistrements créés après la restauration.
+            for table in ("stock_items", "ventes", "vente_articles", "audit_log"):
+                row = conn.execute(f"SELECT MAX(id) m FROM {table}").fetchone()
+                maxid = row["m"] or 0
+                conn.execute("DELETE FROM sqlite_sequence WHERE name = ?", (table,))
+                conn.execute("INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)", (table, maxid))
+
+            conn.execute(
+                "INSERT INTO audit_log (date_iso, acteur, action, cible, motif) VALUES (?,?,?,?,?)",
+                (now_iso(), s["nom"], "restauration_sauvegarde", "toutes les données",
+                 "Restauration depuis une sauvegarde exportée le " + str(data.get("exported_at", "date inconnue"))),
+            )
+            conn.commit()
+        self._send_json(200, {
+            "ok": True,
+            "stock_items": len(data["stock_items"]),
+            "ventes": len(data["ventes"]),
+        })
 
     def _api_change_code(self, conn):
         s = self._require_admin()

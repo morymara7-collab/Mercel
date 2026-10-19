@@ -394,6 +394,28 @@
       ${rows}</table></div></div>`;
   }
 
+  function askConfirmDanger(title, message, confirmLabel, onConfirm){
+    const back = document.createElement("div");
+    back.className = "modal-backdrop";
+    back.innerHTML = `<div class="modal-box">
+      <h3>${esc(title)}</h3>
+      <p>${esc(message)}</p>
+      <div class="errtext" id="confirm-err"></div>
+      <div class="btn-row">
+        <button class="btn secondary" id="confirm-cancel">Annuler</button>
+        <button class="btn danger" id="confirm-ok">${esc(confirmLabel)}</button>
+      </div>
+    </div>`;
+    document.body.appendChild(back);
+    document.getElementById("confirm-cancel").onclick = () => back.remove();
+    document.getElementById("confirm-ok").onclick = async () => {
+      try {
+        await onConfirm();
+        back.remove();
+      } catch(e){ document.getElementById("confirm-err").textContent = e.message; }
+    };
+  }
+
   function askMotif(title, onConfirm){
     const back = document.createElement("div");
     back.className = "modal-backdrop";
@@ -601,6 +623,10 @@
         <h2>Sauvegarde des données</h2>
         <div class="note-inline" style="margin-top:0;margin-bottom:10px;">Tant que l'hébergement reste sur le plan gratuit, les données peuvent être effacées lors d'un redémarrage du service. Télécharge régulièrement une sauvegarde (surtout avant toute période d'inactivité) pour ne rien perdre.</div>
         <button class="btn secondary" id="export-btn">⬇ Exporter les données (.json)</button>
+        <div class="note-inline" style="margin-bottom:10px;">Si les données ont été effacées (redémarrage sur le plan gratuit), tu peux les remettre en place à partir d'un fichier exporté précédemment. <strong>Attention : ceci remplace entièrement les données actuelles</strong> — à utiliser seulement pour restaurer après une perte, pas pour fusionner deux sauvegardes.</div>
+        <input type="file" id="import-file" accept="application/json" style="display:none;">
+        <button class="btn secondary" id="import-btn">⬆ Importer une sauvegarde (.json)</button>
+        <div class="msgtext" id="import-msg"></div>
       </div>
       <div class="card">
         <h2>Journal des modifications</h2>
@@ -680,6 +706,39 @@
       };
       document.getElementById("export-btn").onclick = () => {
         window.open("/api/export?token=" + encodeURIComponent(token), "_blank");
+      };
+      document.getElementById("import-btn").onclick = () => {
+        document.getElementById("import-file").click();
+      };
+      document.getElementById("import-file").onchange = (ev) => {
+        const file = ev.target.files && ev.target.files[0];
+        ev.target.value = ""; // permet de réimporter le même fichier plus tard si besoin
+        if (!file) return;
+        const importMsg = document.getElementById("import-msg");
+        importMsg.style.color = ""; importMsg.textContent = "";
+        const reader = new FileReader();
+        reader.onload = () => {
+          let parsed;
+          try { parsed = JSON.parse(reader.result); }
+          catch(e){ importMsg.style.color = "var(--red)"; importMsg.textContent = "Ce fichier n'est pas une sauvegarde valide (JSON illisible)."; return; }
+          if (!Array.isArray(parsed.stock_items) || !Array.isArray(parsed.ventes)){
+            importMsg.style.color = "var(--red)"; importMsg.textContent = "Ce fichier ne ressemble pas à une sauvegarde de cette application.";
+            return;
+          }
+          const dateTxt = parsed.exported_at ? fmtDate(parsed.exported_at) : "date inconnue";
+          askConfirmDanger(
+            "Restaurer cette sauvegarde ?",
+            `Cette sauvegarde a été exportée le ${dateTxt}. Toutes les données actuelles (ventes, stock, journal) seront remplacées par celles de ce fichier. Cette action ne peut pas être annulée.`,
+            "Oui, restaurer",
+            async () => {
+              await api("/import", { method: "POST", body: parsed });
+              await loadAll(); renderApp();
+              importMsg.style.color = "var(--green)";
+              importMsg.textContent = "Sauvegarde restaurée avec succès.";
+            }
+          );
+        };
+        reader.readAsText(file);
       };
     }
   }
