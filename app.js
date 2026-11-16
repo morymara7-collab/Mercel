@@ -12,6 +12,12 @@
   let audit = [];
   let activeTab = "caisse";
   let draftArticles = [];
+  let events = [];          // flux d'activité (admin + associé)
+  let lastEventId = 0;
+  let unread = 0;
+  let pollTimer = null;
+  const isViewer = () => role === "admin" || role === "associe";
+  const roleLabel = () => role === "admin" ? "Administrateur" : role === "associe" ? "Associé (lecture seule)" : "Caissière";
 
   const $root = document.getElementById("root");
 
@@ -55,16 +61,19 @@
     token = null; role = null; actorName = "";
     localStorage.removeItem("atm_token"); localStorage.removeItem("atm_role"); localStorage.removeItem("atm_nom");
     activeTab = "caisse";
+    stopPolling(); events = []; lastEventId = 0; unread = 0;
     if (reload !== false) render();
   }
 
   async function loadAll(){
     const [stockRes, ventesRes] = await Promise.all([api("/stock"), api("/ventes")]);
     stockItems = stockRes.items; ventes = ventesRes.ventes;
-    if (role === "admin"){
-      const [bilanRes, auditRes] = await Promise.all([api("/bilan"), api("/audit")]);
+    if (isViewer()){
+      const [bilanRes, auditRes, evRes] = await Promise.all([api("/bilan"), api("/audit"), api("/events")]);
       window.__bilan = bilanRes;
       audit = auditRes.audit;
+      events = evRes.events;
+      lastEventId = Math.max(lastEventId, evRes.last_id || 0);
     }
   }
 
@@ -89,7 +98,9 @@
       renderLogin(e.message);
       return;
     }
+    if (role === "associe" && activeTab === "caisse") activeTab = "activite";
     renderApp();
+    if (isViewer()) startPolling();
   }
 
   // ---------------- SETUP ----------------
@@ -100,16 +111,18 @@
         <div class="sub">Personne n'a encore choisi de codes d'accès pour cet atelier. Choisis-les maintenant — tu pourras les changer plus tard depuis l'onglet Administration.</div>
         <div class="field"><label>Code administrateur (toi)</label><input id="su-admin" inputmode="numeric" placeholder="ex. 4 à 6 chiffres"></div>
         <div class="field"><label>Code caisse (à donner à la caissière)</label><input id="su-caisse" inputmode="numeric" placeholder="ex. 4 à 6 chiffres"></div>
+        <div class="field"><label>Code associé (optionnel — lecture seule)</label><input id="su-associe" inputmode="numeric" placeholder="laisse vide pour le créer plus tard"></div>
         <button class="btn" id="su-btn">Créer les codes</button>
         <div class="errtext" id="su-err"></div>
       </div></div>`;
     document.getElementById("su-btn").onclick = async () => {
       const a = document.getElementById("su-admin").value.trim();
       const c = document.getElementById("su-caisse").value.trim();
+      const as = document.getElementById("su-associe").value.trim();
       const err = document.getElementById("su-err");
       err.textContent = "";
       try {
-        await api("/setup", { method: "POST", body: { admin: a, caisse: c } });
+        await api("/setup", { method: "POST", body: { admin: a, caisse: c, associe: as } });
         configured = true;
         render();
       } catch(e){ err.textContent = e.message; }
@@ -149,24 +162,30 @@
     $root.innerHTML = `
       <div class="topbar">
         <div class="brandrow"><img src="/logo.jpg" alt="Mercel Guinée"><div class="brand">MERCEL GUINÉE <small>Atelier — Caisse</small></div></div>
-        <div class="who">${esc(actorName)}<br>${role === "admin" ? "Administrateur" : "Caissière"}
+        <div class="who">${esc(actorName)}<br>${roleLabel()}
           <button class="logout" id="logout-btn">Déconnexion</button>
         </div>
       </div>
       ${alerts.length ? `<div class="alertbar">⚠️ Stock bas : ${alerts.map(a=>esc(a.nom)+" ("+fmtQty(a.quantite)+" "+esc(a.unite)+")").join(", ")}</div>` : ""}
+      ${role === "associe" ? `<div class="viewbar">👁 Mode associé : tu suis l'activité en direct. Tu ne peux rien modifier.</div>` : ""}
       <div class="tabrail" id="tabrail"></div>
       <div id="tabpane"></div>
     `;
     document.getElementById("logout-btn").onclick = () => doLogout();
-    const tabs = [["caisse","Nouveau reçu"],["historique","Historique"],["stock","Stock"]];
-    if (role === "admin") tabs.push(["bilan","Bilan"],["admin","Administration"]);
+    let tabs;
+    if (role === "associe") tabs = [["activite","Activité"],["bilan","Bilan"],["historique","Historique"],["stock","Stock"],["journal","Journal"]];
+    else {
+      tabs = [["caisse","Nouveau reçu"],["historique","Historique"],["stock","Stock"]];
+      if (role === "admin") tabs.push(["activite","Activité"],["bilan","Bilan"],["admin","Administration"]);
+    }
+    if (activeTab === "activite") unread = 0;
     const rail = document.getElementById("tabrail");
     rail.innerHTML = "";
     tabs.forEach(([key,label]) => {
       const b = document.createElement("button");
-      b.textContent = label;
+      b.textContent = label + (key === "activite" && unread > 0 ? " (" + unread + ")" : "");
       b.className = activeTab === key ? "active" : "";
-      b.onclick = () => { activeTab = key; renderApp(); };
+      b.onclick = () => { activeTab = key; if (key === "activite") unread = 0; renderApp(); };
       rail.appendChild(b);
     });
     const pane = document.getElementById("tabpane");
@@ -174,6 +193,9 @@
     if (activeTab === "historique") pane.innerHTML = tplHistorique();
     if (activeTab === "stock") pane.innerHTML = tplStock();
     if (activeTab === "bilan") pane.innerHTML = tplBilan();
+    if (activeTab === "activite") pane.innerHTML = tplActivite();
+    if (activeTab === "journal") pane.innerHTML = tplJournal();
+    document.title = (unread > 0 ? "(" + unread + ") " : "") + "Caisse Atelier Mercel";
     if (activeTab === "admin") pane.innerHTML = tplAdmin();
     wireTab();
   }
@@ -448,8 +470,8 @@
       return `<tr>
         <td>${esc(i.nom)}</td><td>${esc(i.categorie)}</td>
         <td class="num">${fmtQty(i.quantite)} ${esc(i.unite)} <span class="pill ${low?'low':'ok'}">${low?'BAS':'OK'}</span></td>
-        ${role === "admin" ? `<td class="num">${fmtGNF(i.prix_achat)}</td><td class="num">${fmtGNF(i.prix_vente)}</td>
-          <td style="white-space:nowrap;">
+        ${isViewer() ? `<td class="num">${fmtGNF(i.prix_achat)}</td><td class="num">${fmtGNF(i.prix_vente)}</td>` : ""}
+        ${role === "admin" ? `<td style="white-space:nowrap;">
             <button class="btn ghost" style="width:auto;padding:6px 10px;" data-achat="${i.id}">+ Achat</button>
             <button class="btn danger" style="width:auto;padding:6px 10px;margin-left:5px;" data-suppr="${i.id}" title="Supprimer cet article du stock">🗑</button>
           </td>` : ""}
@@ -457,6 +479,8 @@
     }).join("");
     const head = role === "admin"
       ? `<tr><th>Article</th><th>Catégorie</th><th>Quantité</th><th>Prix achat</th><th>Prix vente</th><th></th></tr>`
+      : role === "associe"
+      ? `<tr><th>Article</th><th>Catégorie</th><th>Quantité</th><th>Prix achat</th><th>Prix vente</th></tr>`
       : `<tr><th>Article</th><th>Catégorie</th><th>Quantité</th></tr>`;
     const empty = !sorted.length ? `<div class="empty">Aucun article de stock encore. ${role==="admin"?"Ajoute le premier ci-dessous.":"Demande à l'administrateur d'en ajouter."}</div>` : "";
     return `<div class="card"><h2>État du stock</h2>
@@ -605,14 +629,82 @@
   }
 
   // ---------------- ADMIN ----------------
-  function tplAdmin(){
+  function tplJournal(){
     const rows = audit.slice(0,100).map(a => `<tr><td>${fmtDate(a.date_iso)}</td><td>${esc(a.acteur)}</td><td>${esc(a.action)}</td><td>${esc(a.cible)}</td><td>${esc(a.motif)}</td></tr>`).join("");
+    return `<div class="card">
+        <h2>Journal des modifications</h2>
+        ${audit.length ? `<div class="tablewrap"><table><tr><th>Date</th><th>Par</th><th>Action</th><th>Cible</th><th>Motif</th></tr>${rows}</table></div>` : `<div class="empty">Aucune modification enregistrée.</div>`}
+      </div>`;
+  }
+
+  // ---------------- ACTIVITÉ EN DIRECT (admin + associé) ----------------
+  const EV_ICON = { vente:"💰", annulation:"⛔", achat_stock:"📦", stock_nouveau:"📦", suppression_stock:"🗑", changement_code:"🔑", restauration:"♻️" };
+  function tplActivite(){
+    const notifOk = ("Notification" in window) && Notification.permission === "granted";
+    const rows = events.map(e => `<div class="evrow ev-${esc(e.type)}">
+        <div class="evicon">${EV_ICON[e.type] || "•"}</div>
+        <div class="evbody"><div class="evtxt">${esc(e.resume)}</div>
+        <div class="evmeta">${esc(e.acteur || "—")} · ${fmtDate(e.date_iso)}</div></div></div>`).join("");
+    return `<div class="card">
+        <h2>Activité en direct <span class="livedot" title="mise à jour toutes les 5 secondes"></span></h2>
+        <div class="note-inline" style="margin-top:-6px;margin-bottom:10px;">Chaque reçu, annulation, achat ou changement de stock apparaît ici dans les secondes qui suivent.</div>
+        ${("Notification" in window) && !notifOk ? `<button class="btn ghost" id="notif-btn" style="margin-bottom:12px;">🔔 Activer les alertes sur cet appareil</button>` : ""}
+        ${events.length ? rows : `<div class="empty">Aucune activité pour l'instant.</div>`}
+      </div>`;
+  }
+  function beep(){
+    try {
+      const C = window.AudioContext || window.webkitAudioContext; if (!C) return;
+      const ctx = new C(), o = ctx.createOscillator(), g = ctx.createGain();
+      o.type = "sine"; o.frequency.value = 880; g.gain.value = 0.06;
+      o.connect(g); g.connect(ctx.destination); o.start(); o.stop(ctx.currentTime + 0.18);
+      setTimeout(() => ctx.close(), 400);
+    } catch(e){}
+  }
+  function showToast(text){
+    const t = document.createElement("div");
+    t.className = "toast"; t.textContent = text;
+    document.body.appendChild(t);
+    setTimeout(() => t.classList.add("out"), 5500);
+    setTimeout(() => t.remove(), 6200);
+  }
+  function stopPolling(){ if (pollTimer){ clearInterval(pollTimer); pollTimer = null; } }
+  function startPolling(){
+    stopPolling();
+    pollTimer = setInterval(pollEvents, 5000);
+  }
+  let polling = false;
+  async function pollEvents(){
+    if (!token || !isViewer() || polling) return;
+    polling = true;
+    try {
+      const r = await api("/events?after=" + lastEventId);
+      const fresh = (r.events || []).filter(e => !(role === "admin" && e.acteur === actorName));
+      if (r.events && r.events.length){
+        await loadAll();   // met aussi lastEventId à jour
+        if (fresh.length){
+          if (!(activeTab === "activite" && !document.hidden)) unread += fresh.length;
+          fresh.slice(-3).forEach(e => showToast((EV_ICON[e.type] || "•") + " " + e.resume));
+          beep();
+          if (document.hidden && ("Notification" in window) && Notification.permission === "granted"){
+            try { new Notification("MERCEL Atelier", { body: fresh[fresh.length-1].resume }); } catch(e){}
+          }
+        }
+        const safe = role === "associe" || ["activite","bilan","historique"].includes(activeTab);
+        if (safe) renderApp();
+        else document.title = (unread > 0 ? "(" + unread + ") " : "") + "Caisse Atelier Mercel";
+      }
+    } catch(e){ /* réseau coupé : on réessaie au prochain tour */ }
+    finally { polling = false; }
+  }
+
+  function tplAdmin(){
     return `
       <div class="card">
         <h2>Changer un code d'accès</h2>
         <div class="grid2">
           <div class="field"><label>Rôle</label>
-            <select id="ac-role"><option value="caisse">Code Caisse</option><option value="admin">Code Administrateur</option></select>
+            <select id="ac-role"><option value="caisse">Code Caisse</option><option value="associe">Code Associé (lecture seule)</option><option value="admin">Code Administrateur</option></select>
           </div>
           <div class="field"><label>Nouveau code (4 chiffres min.)</label><input id="ac-code" inputmode="numeric"></div>
         </div>
@@ -628,14 +720,18 @@
         <button class="btn secondary" id="import-btn">⬆ Importer une sauvegarde (.json)</button>
         <div class="msgtext" id="import-msg"></div>
       </div>
-      <div class="card">
-        <h2>Journal des modifications</h2>
-        ${audit.length ? `<div class="tablewrap"><table><tr><th>Date</th><th>Par</th><th>Action</th><th>Cible</th><th>Motif</th></tr>${rows}</table></div>` : `<div class="empty">Aucune modification enregistrée.</div>`}
-      </div>`;
+      ${tplJournal()}`;
   }
 
   // ---------------- WIRE TAB EVENTS ----------------
   function wireTab(){
+    if (activeTab === "activite"){
+      const nb = document.getElementById("notif-btn");
+      if (nb) nb.onclick = async () => {
+        try { await Notification.requestPermission(); } catch(e){}
+        renderApp();
+      };
+    }
     if (activeTab === "caisse"){
       renderArticleLines();
       document.getElementById("add-art-btn").onclick = () => { draftArticles.push({ _k: uid(), item_id: "", quantite: 1 }); renderArticleLines(); updateTotaux(); };

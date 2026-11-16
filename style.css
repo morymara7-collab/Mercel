@@ -128,3 +128,22 @@ tr:last-child td{border-bottom:none;}
   .receipt-backdrop{position:static;background:none;padding:0;}
   .receipt{box-shadow:none;max-height:none;}
 }
+
+.viewbar{background:var(--surface-2);border-bottom:1px solid var(--border);color:var(--ink);font-size:.82rem;padding:9px 16px;}
+.livedot{display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--green);margin-left:6px;vertical-align:middle;animation:pulse 1.8s ease-in-out infinite;}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
+@media (prefers-reduced-motion:reduce){.livedot{animation:none}}
+.evrow{display:flex;gap:10px;padding:10px 0;border-top:1px solid var(--border);}
+.evrow:first-of-type{border-top:none;}
+.evicon{flex:0 0 28px;font-size:1.15rem;text-align:center;}
+.evbody{min-width:0;}
+.evtxt{font-size:.9rem;line-height:1.35;overflow-wrap:anywhere;}
+.evmeta{font-size:.74rem;color:var(--ink-dim);margin-top:2px;}
+.ev-annulation .evtxt{color:var(--red);font-weight:600;}
+.ev-vente .evtxt{font-weight:600;}
+.toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:var(--navy);color:var(--navy-ink);
+  padding:11px 16px;border-radius:10px;font-size:.86rem;max-width:min(92vw,420px);z-index:80;
+  box-shadow:0 8px 24px rgba(0,0,0,.28);margin-top:0;transition:opacity .6s,transform .6s;}
+.toast + .toast{bottom:84px;}
+.toast + .toast + .toast{bottom:144px;}
+.toast.out{opacity:0;transform:translateX(-50%) translateY(-8px);}

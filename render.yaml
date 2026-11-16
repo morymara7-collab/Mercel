@@ -12,6 +12,12 @@ services:
         sync: false
       - key: CAISSE_CODE_DEFAULT
         sync: false
+      - key: ASSOCIE_CODE_DEFAULT
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
     # Plan gratuit : pas de disque persistant possible (Render ne le propose
     # que sur les plans payants). Les ventes/le stock peuvent être effacés si
     # le service redémarre — utilise le bouton "Exporter les données" dans

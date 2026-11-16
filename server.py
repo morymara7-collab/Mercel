@@ -12,6 +12,8 @@ import secrets
 import sqlite3
 import threading
 import time
+import urllib.parse
+import urllib.request
 from datetime import datetime, date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -24,6 +26,10 @@ PORT = int(os.environ.get("PORT", "8000"))
 
 ADMIN_CODE_DEFAULT = os.environ.get("ADMIN_CODE_DEFAULT", "")
 CAISSE_CODE_DEFAULT = os.environ.get("CAISSE_CODE_DEFAULT", "")
+ASSOCIE_CODE_DEFAULT = os.environ.get("ASSOCIE_CODE_DEFAULT", "")
+# Alerte téléphone optionnelle (gratuite) : une alerte Telegram part à chaque modification.
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -97,14 +103,26 @@ def init_db():
             cible TEXT NOT NULL,
             motif TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date_iso TEXT NOT NULL,
+            acteur TEXT NOT NULL,
+            type TEXT NOT NULL,
+            resume TEXT NOT NULL,
+            montant REAL NOT NULL DEFAULT 0
+        );
         """
     )
+    cols = [r["name"] for r in conn.execute("PRAGMA table_info(config)").fetchall()]
+    if "associe_code" not in cols:
+        conn.execute("ALTER TABLE config ADD COLUMN associe_code TEXT NOT NULL DEFAULT ''")
     conn.commit()
     row = conn.execute("SELECT * FROM config WHERE id = 1").fetchone()
     if row is None and ADMIN_CODE_DEFAULT and CAISSE_CODE_DEFAULT:
         conn.execute(
-            "INSERT INTO config (id, admin_code, caisse_code, created_iso) VALUES (1, ?, ?, ?)",
-            (ADMIN_CODE_DEFAULT, CAISSE_CODE_DEFAULT, now_iso()),
+            "INSERT INTO config (id, admin_code, caisse_code, associe_code, created_iso) VALUES (1, ?, ?, ?, ?)",
+            (ADMIN_CODE_DEFAULT, CAISSE_CODE_DEFAULT, ASSOCIE_CODE_DEFAULT, now_iso()),
         )
         conn.commit()
     conn.close()
@@ -112,6 +130,42 @@ def init_db():
 
 def now_iso():
     return datetime.utcnow().isoformat() + "Z"
+
+
+def fmt_q(n):
+    n = round(float(n or 0), 2)
+    return str(int(n)) if n == int(n) else str(n)
+
+
+def fmt_gnf(n):
+    return f"{round(float(n or 0)):,}".replace(",", " ") + " GNF"
+
+
+def notify_async(text):
+    """Envoie une alerte Telegram (si configurée) sans bloquer la requête."""
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        return
+
+    def _send():
+        try:
+            data = urllib.parse.urlencode({"chat_id": TELEGRAM_CHAT_ID, "text": text}).encode("utf-8")
+            req = urllib.request.Request(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", data=data
+            )
+            urllib.request.urlopen(req, timeout=8).read()
+        except Exception:
+            pass
+
+    threading.Thread(target=_send, daemon=True).start()
+
+
+def log_event(conn, acteur, type_, resume, montant=0.0):
+    """Enregistre un événement visible en direct par l'associé (le commit est fait par l'appelant)."""
+    conn.execute(
+        "INSERT INTO events (date_iso, acteur, type, resume, montant) VALUES (?,?,?,?,?)",
+        (now_iso(), acteur or "", type_, resume, float(montant or 0)),
+    )
+    notify_async(f"MERCEL Atelier\n{acteur or '—'} : {resume}")
 
 
 # ---------------- sessions (in-memory; fine for a single small instance) ----------------
@@ -209,6 +263,13 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(401, "Session invalide ou expirée. Reconnecte-toi.")
         return s
 
+    def _require_viewer(self):
+        """Administrateur ou associé (lecture seule)."""
+        s = self._auth()
+        if s["role"] not in ("admin", "associe"):
+            raise ApiError(403, "Réservé à l'administrateur ou à l'associé.")
+        return s
+
     def _require_admin(self):
         s = self._auth()
         if s["role"] != "admin":
@@ -297,7 +358,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path == "/api/ventes":
                 s = self._auth()
-                if s["role"] == "admin":
+                if s["role"] in ("admin", "associe"):
                     rows = conn.execute("SELECT * FROM ventes ORDER BY date_iso DESC LIMIT 500").fetchall()
                 else:
                     rows = conn.execute(
@@ -313,11 +374,27 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(200, {"ventes": out})
                 return
             if path == "/api/bilan":
-                self._require_admin()
+                self._require_viewer()
                 self._send_json(200, self._compute_bilan(conn))
                 return
+            if path == "/api/events":
+                self._require_viewer()
+                q = parse_qs(urlparse(self.path).query)
+                if "after" in q:
+                    try:
+                        after = int(q["after"][0] or 0)
+                    except ValueError:
+                        after = 0
+                    rows = conn.execute(
+                        "SELECT * FROM events WHERE id > ? ORDER BY id ASC LIMIT 200", (after,)
+                    ).fetchall()
+                else:
+                    rows = conn.execute("SELECT * FROM events ORDER BY id DESC LIMIT 60").fetchall()
+                last = conn.execute("SELECT MAX(id) m FROM events").fetchone()["m"] or 0
+                self._send_json(200, {"events": [dict(r) for r in rows], "last_id": last})
+                return
             if path == "/api/audit":
-                self._require_admin()
+                self._require_viewer()
                 rows = conn.execute("SELECT * FROM audit_log ORDER BY date_iso DESC LIMIT 300").fetchall()
                 self._send_json(200, {"audit": [dict(r) for r in rows]})
                 return
@@ -411,6 +488,9 @@ class Handler(BaseHTTPRequestHandler):
             if method == "POST" and path == "/api/login":
                 self._api_login(conn)
                 return
+            # Toute autre écriture : l'associé est en lecture seule, sans exception.
+            if self._auth()["role"] == "associe":
+                raise ApiError(403, "Accès en lecture seule : l'associé ne peut rien modifier.")
             if method == "POST" and path == "/api/stock":
                 self._api_stock_create(conn)
                 return
@@ -446,14 +526,17 @@ class Handler(BaseHTTPRequestHandler):
         data = self._read_json()
         admin = (data.get("admin") or "").strip()
         caisse = (data.get("caisse") or "").strip()
+        associe = (data.get("associe") or "").strip()
         if len(admin) < 4 or len(caisse) < 4:
             raise ApiError(400, "Chaque code doit avoir au moins 4 chiffres.")
-        if admin == caisse:
-            raise ApiError(400, "Les deux codes doivent être différents.")
+        if associe and len(associe) < 4:
+            raise ApiError(400, "Le code associé doit avoir au moins 4 chiffres (ou reste vide).")
+        if len({c for c in (admin, caisse, associe) if c}) != len([c for c in (admin, caisse, associe) if c]):
+            raise ApiError(400, "Les codes doivent tous être différents.")
         with _db_lock:
             conn.execute(
-                "INSERT INTO config (id, admin_code, caisse_code, created_iso) VALUES (1, ?, ?, ?)",
-                (admin, caisse, now_iso()),
+                "INSERT INTO config (id, admin_code, caisse_code, associe_code, created_iso) VALUES (1, ?, ?, ?, ?)",
+                (admin, caisse, associe, now_iso()),
             )
             conn.commit()
         self._send_json(200, {"ok": True})
@@ -471,13 +554,15 @@ class Handler(BaseHTTPRequestHandler):
             role = "admin"
         elif code == cfg["caisse_code"]:
             role = "caissiere"
+        elif cfg["associe_code"] and code == cfg["associe_code"]:
+            role = "associe"
         else:
             raise ApiError(401, "Code incorrect.")
         token = create_session(role, nom)
         self._send_json(200, {"token": token, "role": role, "nom": nom})
 
     def _api_stock_create(self, conn):
-        self._auth()
+        s = self._auth()
         data = self._read_json()
         nom = (data.get("nom") or "").strip()
         if not nom:
@@ -496,6 +581,8 @@ class Handler(BaseHTTPRequestHandler):
                     (now_iso(), self.headers.get("X-Actor-Name", ""), "achat_stock", existing["nom"],
                      f"+{qte} {existing['unite']} (ajout via formulaire nouvel article)"),
                 )
+                log_event(conn, s["nom"], "achat_stock",
+                          f"Ajout au stock : {existing['nom']} +{fmt_q(qte)} {existing['unite']}")
                 conn.commit()
                 self._send_json(200, {"merged": True, "id": existing["id"]})
                 return
@@ -506,6 +593,9 @@ class Handler(BaseHTTPRequestHandler):
                  float(data.get("seuil_alerte") or 2), float(data.get("prix_achat") or 0),
                  float(data.get("prix_vente") or 0)),
             )
+            log_event(conn, s["nom"], "stock_nouveau",
+                      f"Nouvel article en stock : {nom} ({fmt_q(qte)} {data.get('unite') or 'pièce'}, "
+                      f"vente {fmt_gnf(data.get('prix_vente') or 0)})")
             conn.commit()
             self._send_json(200, {"merged": False, "id": cur.lastrowid})
 
@@ -535,6 +625,7 @@ class Handler(BaseHTTPRequestHandler):
                 "INSERT INTO audit_log (date_iso, acteur, action, cible, motif) VALUES (?,?,?,?,?)",
                 (now_iso(), s["nom"], "achat_stock", item["nom"], motif),
             )
+            log_event(conn, s["nom"], "achat_stock", f"Achat de stock : {item['nom']} {motif}")
             conn.commit()
         self._send_json(200, {"ok": True})
 
@@ -553,6 +644,8 @@ class Handler(BaseHTTPRequestHandler):
                 "INSERT INTO audit_log (date_iso, acteur, action, cible, motif) VALUES (?,?,?,?,?)",
                 (now_iso(), s["nom"], "suppression_stock", item["nom"], motif),
             )
+            log_event(conn, s["nom"], "suppression_stock",
+                      f"Article supprimé du stock : {item['nom']} (motif : {motif})")
             conn.commit()
         self._send_json(200, {"ok": True})
 
@@ -620,6 +713,9 @@ class Handler(BaseHTTPRequestHandler):
                     (vente_id, item_id, nom, qte),
                 )
                 conn.execute("UPDATE stock_items SET quantite = quantite - ? WHERE id = ?", (qte, item_id))
+            log_event(conn, s["nom"], "vente",
+                      f"Nouveau reçu {numero} : {client_nom}, {fmt_gnf(montant)} ({', '.join(types_travail)})",
+                      montant)
             conn.commit()
 
             row = conn.execute("SELECT * FROM ventes WHERE id = ?", (vente_id,)).fetchone()
@@ -656,6 +752,8 @@ class Handler(BaseHTTPRequestHandler):
                 "INSERT INTO audit_log (date_iso, acteur, action, cible, motif) VALUES (?,?,?,?,?)",
                 (now_iso(), s["nom"], "annulation_vente", "reçu " + v["numero"], motif),
             )
+            log_event(conn, s["nom"], "annulation",
+                      f"Reçu {v['numero']} ANNULÉ ({fmt_gnf(v['montant'])}) — motif : {motif}", v["montant"])
             conn.commit()
         self._send_json(200, {"ok": True})
 
@@ -722,6 +820,8 @@ class Handler(BaseHTTPRequestHandler):
                 (now_iso(), s["nom"], "restauration_sauvegarde", "toutes les données",
                  "Restauration depuis une sauvegarde exportée le " + str(data.get("exported_at", "date inconnue"))),
             )
+            log_event(conn, s["nom"], "restauration",
+                      "Sauvegarde restaurée : stock, reçus et journal remplacés par le fichier importé")
             conn.commit()
         self._send_json(200, {
             "ok": True,
@@ -734,17 +834,22 @@ class Handler(BaseHTTPRequestHandler):
         data = self._read_json()
         role = data.get("role")
         new_code = (data.get("code") or "").strip()
-        if role not in ("admin", "caisse"):
+        if role not in ("admin", "caisse", "associe"):
             raise ApiError(400, "Rôle invalide.")
         if len(new_code) < 4:
             raise ApiError(400, "Le code doit avoir au moins 4 chiffres.")
-        field = "admin_code" if role == "admin" else "caisse_code"
+        field = {"admin": "admin_code", "caisse": "caisse_code", "associe": "associe_code"}[role]
+        cfg = conn.execute("SELECT * FROM config WHERE id = 1").fetchone()
+        for other in ("admin_code", "caisse_code", "associe_code"):
+            if other != field and cfg[other] and cfg[other] == new_code:
+                raise ApiError(400, "Ce code est déjà utilisé par un autre rôle. Choisis-en un différent.")
         with _db_lock:
             conn.execute(f"UPDATE config SET {field} = ? WHERE id = 1", (new_code,))
             conn.execute(
                 "INSERT INTO audit_log (date_iso, acteur, action, cible, motif) VALUES (?,?,?,?,?)",
                 (now_iso(), s["nom"], "changement_code", role, "Changement demandé par l'administrateur"),
             )
+            log_event(conn, s["nom"], "changement_code", f"Code d'accès « {role} » modifié")
             conn.commit()
         self._send_json(200, {"ok": True})
 

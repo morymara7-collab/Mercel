@@ -12,6 +12,12 @@ services:
         sync: false
       - key: CAISSE_CODE_DEFAULT
         sync: false
+      - key: ASSOCIE_CODE_DEFAULT
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
     disk:
       name: atelier-data
       mountPath: /data
